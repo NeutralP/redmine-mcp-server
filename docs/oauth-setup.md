@@ -1,29 +1,50 @@
-# OAuth2 Multi-Tenant Setup Guide
+# OAuth2 Setup Guide
 
-Set up the MCP server so each user authenticates with their own Redmine account.
+The MCP server in OAuth mode acts as a **DCR-capable OAuth proxy** in front of Redmine. MCP clients (Claude Desktop, Codex CLI, VS Code, Claude Code, Kiro) connect with no manual `client_id`/`client_secret` — they Dynamic-Client-Register against this server, which bridges the flow to Redmine's static Doorkeeper application.
 
-**Requirements:** Redmine 6.1+ and admin access to register an OAuth application.
+**Requirements:** Redmine 6.1+ and admin access to register one OAuth application.
 
-## Step 1: Register an OAuth App in Redmine
+## How it works
 
-1. Log in as admin → **Administration → Applications** → **New Application**
-2. Fill in:
-   - **Name:** `MCP Server`
-   - **Redirect URI:** `http://127.0.0.1:PORT/callback` (see redirect URIs below)
-   - **Confidential:** Yes
-3. Save and note the **Client ID** and **Client Secret**
+```
+MCP client ──► MCP server (OAuth proxy) ──► Redmine Doorkeeper
+   │ DCR /register, /authorize        │ /oauth/authorize
+   │ /token, /auth/callback           │ /oauth/token
+   │ FastMCP-issued JWT               │ Redmine access token
+   │ (held client-side)               │ (held server-side)
+```
 
-## Step 2: Configure the MCP Server
+- The MCP client only ever sees a short-lived FastMCP JWT.
+- The real Redmine access token lives in the MCP server's upstream token store and is attached to outbound Redmine API calls.
+- Every `/register` call gets its own ephemeral `client_id`/`client_secret`. The single static Redmine OAuth application is shared across all clients but its secret never leaves the server.
+
+## Step 1 — Register one OAuth app in Redmine
+
+**Administration → Applications → New Application**
+
+| Field | Value |
+|---|---|
+| Name | `MCP Server` |
+| Redirect URI | `<REDMINE_MCP_BASE_URL>/auth/callback` (one URI, fixed) |
+| Confidential | Yes |
+
+Save the resulting **Client ID** and **Client Secret**.
+
+## Step 2 — Configure the MCP server
 
 ```bash
 REDMINE_AUTH_MODE=oauth
 REDMINE_URL=https://redmine.example.com
 REDMINE_MCP_BASE_URL=https://mcp.example.com   # public URL of this server
+REDMINE_OAUTH_CLIENT_ID=<from Step 1>
+REDMINE_OAUTH_CLIENT_SECRET=<from Step 1>
+# Optional:
+# REDMINE_OAUTH_SCOPES=
 ```
 
 Set these in `.env` (local) or `.env.docker` (Docker). Legacy credentials are not needed in OAuth mode.
 
-## Step 3: Start and Verify
+## Step 3 — Start and verify
 
 ```bash
 # Local
@@ -33,51 +54,50 @@ uv run python -m redmine_mcp_server.main
 docker-compose up --build -d
 ```
 
-Verify discovery endpoints:
+Quick check — the discovery document must advertise `registration_endpoint`:
+
 ```bash
-curl http://localhost:8000/.well-known/oauth-protected-resource
-curl http://localhost:8000/.well-known/oauth-authorization-server
+curl -s http://localhost:8000/.well-known/oauth-authorization-server | jq .registration_endpoint
+# → "http://localhost:8000/register"
 ```
 
-## Step 4: Connect Your MCP Client
+## Step 4 — Connect any MCP client
 
-MCP clients handle the OAuth flow automatically — when connecting to the server, the client opens a browser for the user to log in to Redmine. No manual token management needed.
+Clients handle the full flow automatically:
 
-### Client Compatibility
+```bash
+codex mcp login redmine          # → opens browser, succeeds
+```
 
 | Client | OAuth2 | Notes |
-|--------|--------|-------|
-| **VS Code** (1.102+) | Yes | Full OAuth 2.1 with PKCE and DCR |
-| **Claude Code** | Yes | Auto browser flow on 401. Use `--callback-port` for fixed port |
-| **Claude Desktop** | Yes | Via Settings → Connectors. Requires DCR |
-| **Codex CLI** | Yes | Use `codex mcp login`. Configurable callback port |
-| **Kiro** | Yes | Configurable `oauth.redirectUri`. Implementation is newer |
+|---|---|---|
+| **Claude Desktop** | Yes | Settings → Connectors. **Now works** (DCR via `/register`) |
+| **Claude Code** | Yes | Auto browser flow on 401 |
+| **Codex CLI** | Yes | `codex mcp login <name>` |
+| **VS Code** (1.102+) | Yes | Full OAuth 2.1 + PKCE + DCR |
+| **Kiro** | Yes | Configurable `oauth.redirectUri` |
 
-### Redirect URIs
+No client needs manual `client_id`/`client_secret`. The redirect URI in Redmine is fixed at `<REDMINE_MCP_BASE_URL>/auth/callback`; clients use their own dynamic localhost callbacks, which the proxy bridges.
 
-Set this in Redmine's OAuth app (Step 1) to match your client:
+## Migrating from legacy mode
 
-| Client | Redirect URI |
-|--------|-------------|
-| VS Code | `http://127.0.0.1:PORT/callback` |
-| Claude Code | `http://127.0.0.1:PORT/oauth/callback` |
-| Codex CLI | `http://127.0.0.1:PORT/callback` |
-| Kiro | Configurable via `oauth.redirectUri` |
-
-> **Note on DCR:** Some clients (Claude Desktop, VS Code) expect Dynamic Client Registration. Redmine's Doorkeeper does not support DCR, so you must pre-register the app manually (Step 1) and configure the client with the `client_id`/`client_secret`.
-
-## Migrating from Legacy Mode
-
-1. Set `REDMINE_AUTH_MODE=oauth` and restart — no downtime needed
-2. Remove legacy credentials from `.env` once confirmed working
-3. To rollback: set `REDMINE_AUTH_MODE=legacy` (or remove the variable)
+1. Register the OAuth app (Step 1) and set the four env vars (Step 2).
+2. Restart — no downtime needed.
+3. Once confirmed, remove `REDMINE_API_KEY` / `REDMINE_USERNAME` / `REDMINE_PASSWORD`.
+4. Rollback: set `REDMINE_AUTH_MODE=legacy`.
 
 ## Troubleshooting
 
 | Error | Cause | Fix |
-|-------|-------|-----|
-| `{"error": "unauthorized"}` | Missing Bearer token | Check client is sending `Authorization` header |
-| `{"error": "invalid_token"}` | Token expired/revoked | Test directly: `curl -H "Authorization: Bearer <token>" REDMINE_URL/users/current.json` |
-| Discovery endpoints 404 | Not in OAuth mode | Ensure `REDMINE_AUTH_MODE=oauth` is set |
-| Token works in Redmine but not MCP | Wrong `REDMINE_URL` | In Docker, use internal hostname (e.g., `http://redmine:3000`) |
-| "Applications" menu missing | Redmine too old | Requires Redmine 6.1+ |
+|---|---|---|
+| `Dynamic client registration not supported` | Server isn't in OAuth mode, or running an old build | Check `REDMINE_AUTH_MODE=oauth`; `curl /.well-known/oauth-authorization-server` should show `registration_endpoint` |
+| `OAuth mode requires the following env vars` at startup | `REDMINE_OAUTH_CLIENT_ID/SECRET` missing | Set both env vars |
+| Browser opens, Redmine login OK, callback errors | Redirect URI in Redmine doesn't match `<REDMINE_MCP_BASE_URL>/auth/callback` | Update Redmine app's Redirect URI |
+| Token works in Redmine but MCP returns 401 | `REDMINE_URL` is wrong from inside the container | In Docker, use the internal hostname (e.g. `http://redmine:3000`) |
+| "Applications" menu missing in Redmine | Redmine too old | Requires Redmine 6.1+ |
+
+## Security notes
+
+- The MCP server holds the Redmine access token; it is not exposed to MCP clients.
+- The default upstream-token store is in-memory. For multi-replica deployments, configure FastMCP with a persistent `client_storage` backend.
+- Run behind HTTPS in production. FastMCP logs a warning on startup when the cookie used for the consent flow is set without `Secure`.

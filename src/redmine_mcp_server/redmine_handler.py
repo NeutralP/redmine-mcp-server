@@ -185,9 +185,9 @@ def _get_redmine_client() -> Redmine:
     if redmine is not None:
         return redmine
 
-    from .oauth_middleware import current_redmine_token
+    from .oauth_middleware import get_current_token
 
-    token = current_redmine_token.get()
+    token = get_current_token()
 
     if token:
         # OAuth mode: per-request client with Bearer token (cannot be cached)
@@ -205,8 +205,19 @@ def _get_redmine_client() -> Redmine:
     return _legacy_client
 
 
-# Initialize FastMCP server
-mcp = FastMCP("redmine_mcp_tools")
+# Initialize FastMCP server. In OAuth mode we attach FastMCP's OAuthProxy as
+# the auth provider — it serves /.well-known discovery, /register (DCR shim),
+# /authorize, /token, and /auth/callback, and bridges DCR-only MCP clients
+# (Claude Desktop, Codex CLI, VS Code) to Redmine's static Doorkeeper app.
+def _build_mcp() -> FastMCP:
+    if REDMINE_AUTH_MODE == "oauth":
+        from .oauth_middleware import build_oauth_proxy
+
+        return FastMCP("redmine_mcp_tools", auth=build_oauth_proxy())
+    return FastMCP("redmine_mcp_tools")
+
+
+mcp = _build_mcp()
 
 
 class CleanupTaskManager:
