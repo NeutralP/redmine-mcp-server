@@ -4,7 +4,17 @@ Configuration file for pytest.
 This file configures pytest markers and test settings for the Redmine MCP server tests.
 """
 
-import pytest
+import os
+
+# Provide harmless OAuth credentials so importing redmine_handler succeeds even
+# when a parent .env sets REDMINE_AUTH_MODE=oauth. Tests that exercise the
+# OAuth proxy directly override these as needed; tests that don't touch OAuth
+# remain unaffected. Use setdefault so real env values are respected.
+os.environ.setdefault("REDMINE_OAUTH_CLIENT_ID", "test-client-id")
+os.environ.setdefault("REDMINE_OAUTH_CLIENT_SECRET", "test-client-secret")
+os.environ.setdefault("REDMINE_MCP_BASE_URL", "http://localhost:8000")
+
+import pytest  # noqa: E402
 
 
 def pytest_configure(config):

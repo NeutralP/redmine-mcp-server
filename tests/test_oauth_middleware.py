@@ -1,45 +1,153 @@
-"""
-Tests for OAuth2 middleware and related functionality.
+"""Tests for the OAuth integration.
 
-Tests cover:
-- RedmineOAuthMiddleware: token validation, skip paths, error responses
-- get_current_token(): ContextVar access
-- _get_redmine_client(): OAuth vs legacy auth selection
+Covers:
+  * RedmineTokenVerifier — validates tokens via Redmine /users/current.json
+  * build_oauth_proxy() — env-var validation and proxy construction
+  * get_current_token() — reads upstream token from FastMCP request context
+  * _get_redmine_client() — falls through to legacy auth when no OAuth context
+  * The mounted FastMCP app — exposes /register, /.well-known/* with the
+    registration_endpoint advertised (the fix for "Dynamic client registration
+    not supported").
 """
+
+from __future__ import annotations
 
 import os
 
-# Set required env vars before any project module is imported, because
-# oauth_middleware.py reads REDMINE_URL at module level.
+# Set required env vars before any project module is imported.
 os.environ.setdefault("REDMINE_URL", "https://test-redmine.example.com")
-os.environ.setdefault("REDMINE_MCP_BASE_URL", "http://localhost:3040")
+os.environ.setdefault("REDMINE_MCP_BASE_URL", "http://localhost:8000")
+os.environ.setdefault("REDMINE_OAUTH_CLIENT_ID", "test-client")
+os.environ.setdefault("REDMINE_OAUTH_CLIENT_SECRET", "test-secret")
 
 import pytest  # noqa: E402
 from unittest.mock import patch, AsyncMock, MagicMock  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
+
 # ---------------------------------------------------------------------------
-# Helpers
+# RedmineTokenVerifier
 # ---------------------------------------------------------------------------
 
 
-def _make_app():
-    """Return a minimal Starlette app with the OAuth middleware attached."""
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
-    from starlette.routing import Route
-    from redmine_mcp_server.oauth_middleware import RedmineOAuthMiddleware
+@pytest.mark.unit
+class TestRedmineTokenVerifier:
+    @pytest.mark.asyncio
+    async def test_valid_token_returns_access_token(self):
+        from redmine_mcp_server.oauth_middleware import RedmineTokenVerifier
 
-    async def protected(request: Request):
-        from redmine_mcp_server.oauth_middleware import current_redmine_token
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"user": {"id": 42}}
 
-        token = current_redmine_token.get()
-        return JSONResponse({"token": token})
+        with patch(
+            "redmine_mcp_server.oauth_middleware.httpx.AsyncClient"
+        ) as mock_cls:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(return_value=mock_response)
+            mock_cls.return_value = client
 
-    app = Starlette(routes=[Route("/protected", protected)])
-    app.add_middleware(RedmineOAuthMiddleware)
-    return app
+            result = await RedmineTokenVerifier().verify_token("good-token")
+
+        assert result is not None
+        assert result.token == "good-token"
+        assert result.client_id == "redmine:42"
+
+    @pytest.mark.asyncio
+    async def test_invalid_token_returns_none(self):
+        from redmine_mcp_server.oauth_middleware import RedmineTokenVerifier
+
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+
+        with patch(
+            "redmine_mcp_server.oauth_middleware.httpx.AsyncClient"
+        ) as mock_cls:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(return_value=mock_response)
+            mock_cls.return_value = client
+
+            result = await RedmineTokenVerifier().verify_token("bad-token")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_redmine_unreachable_returns_none(self):
+        import httpx
+
+        from redmine_mcp_server.oauth_middleware import RedmineTokenVerifier
+
+        with patch(
+            "redmine_mcp_server.oauth_middleware.httpx.AsyncClient"
+        ) as mock_cls:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(side_effect=httpx.RequestError("boom"))
+            mock_cls.return_value = client
+
+            result = await RedmineTokenVerifier().verify_token("any-token")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_forwards_token_as_bearer(self):
+        from redmine_mcp_server.oauth_middleware import RedmineTokenVerifier
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"user": {"id": 1}}
+
+        with patch(
+            "redmine_mcp_server.oauth_middleware.httpx.AsyncClient"
+        ) as mock_cls:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=False)
+            client.get = AsyncMock(return_value=mock_response)
+            mock_cls.return_value = client
+
+            await RedmineTokenVerifier().verify_token("forward-me")
+
+        sent = client.get.call_args.kwargs["headers"]["Authorization"]
+        assert sent == "Bearer forward-me"
+
+
+# ---------------------------------------------------------------------------
+# build_oauth_proxy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBuildOAuthProxy:
+    def test_builds_with_required_env(self):
+        from redmine_mcp_server.oauth_middleware import build_oauth_proxy
+
+        proxy = build_oauth_proxy()
+        assert proxy is not None
+        # OAuthProxy stores upstream endpoints with these attribute names.
+        assert proxy._upstream_token_endpoint.endswith("/oauth/token")
+        assert proxy._upstream_authorization_endpoint.endswith("/oauth/authorize")
+
+    def test_missing_client_id_raises(self):
+        from redmine_mcp_server.oauth_middleware import build_oauth_proxy
+
+        with patch.dict(os.environ, {"REDMINE_OAUTH_CLIENT_ID": ""}, clear=False):
+            with pytest.raises(RuntimeError, match="REDMINE_OAUTH_CLIENT_ID"):
+                build_oauth_proxy()
+
+    def test_missing_client_secret_raises(self):
+        from redmine_mcp_server.oauth_middleware import build_oauth_proxy
+
+        with patch.dict(
+            os.environ, {"REDMINE_OAUTH_CLIENT_SECRET": ""}, clear=False
+        ):
+            with pytest.raises(RuntimeError, match="REDMINE_OAUTH_CLIENT_SECRET"):
+                build_oauth_proxy()
 
 
 # ---------------------------------------------------------------------------
@@ -49,408 +157,24 @@ def _make_app():
 
 @pytest.mark.unit
 class TestGetCurrentToken:
-    """Tests for the get_current_token() helper."""
+    def test_returns_none_outside_request_context(self):
+        from redmine_mcp_server.oauth_middleware import get_current_token
 
-    def test_raises_when_no_token_in_context(self):
-        """Raises RuntimeError when called outside middleware context."""
-        from redmine_mcp_server.oauth_middleware import (
-            get_current_token,
-            current_redmine_token,
+        # Outside a FastMCP request, get_access_token() raises or returns None;
+        # the helper must absorb that and return None.
+        assert get_current_token() is None
+
+    def test_returns_token_from_access_token(self):
+        from redmine_mcp_server import oauth_middleware
+        from mcp.server.auth.provider import AccessToken
+
+        fake = AccessToken(
+            token="ctx-token-xyz", client_id="redmine:1", scopes=[]
         )
-
-        # Make sure ContextVar is empty
-        token_var = current_redmine_token.set(None)
-        try:
-            with pytest.raises(RuntimeError, match="No Redmine token in context"):
-                get_current_token()
-        finally:
-            current_redmine_token.reset(token_var)
-
-    def test_returns_token_when_set(self):
-        """Returns the token stored in the ContextVar."""
-        from redmine_mcp_server.oauth_middleware import (
-            get_current_token,
-            current_redmine_token,
-        )
-
-        token_var = current_redmine_token.set("my-test-token")
-        try:
-            assert get_current_token() == "my-test-token"
-        finally:
-            current_redmine_token.reset(token_var)
-
-
-# ---------------------------------------------------------------------------
-# RedmineOAuthMiddleware — skip paths
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestOAuthMiddlewareSkipPaths:
-    """Requests to skip-listed paths must pass through without auth."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "/.well-known/oauth-protected-resource",
-            "/.well-known/oauth-authorization-server",
-            "/health",
-            "/revoke",
-        ],
-    )
-    async def test_skip_path_passes_without_auth(self, path):
-        """Skip-listed paths are not blocked by the middleware."""
-        from starlette.applications import Starlette
-        from starlette.requests import Request
-        from starlette.responses import JSONResponse
-        from starlette.routing import Route
-        from redmine_mcp_server.oauth_middleware import RedmineOAuthMiddleware
-
-        async def handler(request: Request):
-            return JSONResponse({"ok": True})
-
-        app = Starlette(routes=[Route(path, handler)])
-        app.add_middleware(RedmineOAuthMiddleware)
-
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get(path)
-
-        assert response.status_code == 200
-
-
-# ---------------------------------------------------------------------------
-# RedmineOAuthMiddleware — missing / malformed Authorization header
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestOAuthMiddlewareMissingHeader:
-    """Requests without a valid Bearer token must be rejected with 401."""
-
-    @pytest.mark.asyncio
-    async def test_no_auth_header_returns_401(self):
-        app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get("/protected")
-
-        assert response.status_code == 401
-        assert response.json()["error"] == "unauthorized"
-
-    @pytest.mark.asyncio
-    async def test_no_auth_header_includes_www_authenticate(self):
-        app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get("/protected")
-
-        www_auth = response.headers.get("www-authenticate", "")
-        assert "Bearer" in www_auth
-        assert "resource_metadata" in www_auth
-        # No error= hint when the header is absent entirely
-        assert "error=" not in www_auth
-
-    @pytest.mark.asyncio
-    async def test_non_bearer_scheme_returns_401(self):
-        app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get(
-                "/protected", headers={"Authorization": "Basic dXNlcjpwYXNz"}
-            )
-
-        assert response.status_code == 401
-        assert response.json()["error"] == "unauthorized"
-
-
-# ---------------------------------------------------------------------------
-# RedmineOAuthMiddleware — Redmine token validation
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestOAuthMiddlewareTokenValidation:
-    """Middleware must validate the token against Redmine /users/current.json."""
-
-    @pytest.mark.asyncio
-    async def test_valid_token_passes_request(self):
-        """A token accepted by Redmine lets the request through."""
-        app = _make_app()
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        with patch("redmine_mcp_server.oauth_middleware.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.get(
-                    "/protected", headers={"Authorization": "Bearer valid-token"}
-                )
-
-        assert response.status_code == 200
-        assert response.json()["token"] == "valid-token"
-
-    @pytest.mark.asyncio
-    async def test_valid_token_forwarded_to_redmine_with_bearer(self):
-        """Middleware calls Redmine with the same Bearer token."""
-        app = _make_app()
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        with patch("redmine_mcp_server.oauth_middleware.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                await client.get(
-                    "/protected", headers={"Authorization": "Bearer my-token-123"}
-                )
-
-            call_kwargs = mock_client.get.call_args
-            assert (
-                call_kwargs.kwargs["headers"]["Authorization"] == "Bearer my-token-123"
-            )
-
-    @pytest.mark.asyncio
-    async def test_invalid_token_returns_401(self):
-        """A token rejected by Redmine (non-200) returns 401."""
-        app = _make_app()
-
-        mock_response = MagicMock()
-        mock_response.status_code = 401
-
-        with patch("redmine_mcp_server.oauth_middleware.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.get(
-                    "/protected", headers={"Authorization": "Bearer bad-token"}
-                )
-
-        assert response.status_code == 401
-        assert response.json()["error"] == "invalid_token"
-
-    @pytest.mark.asyncio
-    async def test_invalid_token_includes_error_in_www_authenticate(self):
-        """WWW-Authenticate header includes error= hint for rejected tokens."""
-        app = _make_app()
-
-        mock_response = MagicMock()
-        mock_response.status_code = 403
-
-        with patch("redmine_mcp_server.oauth_middleware.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.get(
-                    "/protected", headers={"Authorization": "Bearer bad-token"}
-                )
-
-        www_auth = response.headers.get("www-authenticate", "")
-        assert 'error="invalid_token"' in www_auth
-
-    @pytest.mark.asyncio
-    async def test_redmine_unreachable_returns_503(self):
-        """503 when Redmine cannot be reached."""
-        import httpx
-
-        app = _make_app()
-
-        with patch("redmine_mcp_server.oauth_middleware.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(
-                side_effect=httpx.RequestError("connection refused")
-            )
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.get(
-                    "/protected", headers={"Authorization": "Bearer any-token"}
-                )
-
-        assert response.status_code == 503
-        assert response.json()["error"] == "upstream_unavailable"
-
-    @pytest.mark.asyncio
-    async def test_context_var_reset_after_request(self):
-        """ContextVar is reset to None after the request completes."""
-        from redmine_mcp_server.oauth_middleware import current_redmine_token
-
-        app = _make_app()
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        with patch("redmine_mcp_server.oauth_middleware.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.get = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                await client.get(
-                    "/protected", headers={"Authorization": "Bearer some-token"}
-                )
-
-        assert current_redmine_token.get() is None
-
-
-# ---------------------------------------------------------------------------
-# /.well-known endpoints via the real app
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestWellKnownEndpoints:
-    """Tests for the OAuth2 discovery endpoints served by main.py."""
-
-    @pytest.fixture
-    def app(self):
-        from redmine_mcp_server.main import app, register_oauth_routes
-
-        register_oauth_routes(app)
-        return app
-
-    @pytest.mark.asyncio
-    async def test_protected_resource_metadata_shape(self, app):
-        """/.well-known/oauth-protected-resource returns required fields."""
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get("/.well-known/oauth-protected-resource")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert "resource" in data
-        assert "authorization_servers" in data
-        assert isinstance(data["authorization_servers"], list)
-        assert len(data["authorization_servers"]) > 0
-        assert data["bearer_methods_supported"] == ["header"]
-        assert "resource_name" in data
-
-    @pytest.mark.asyncio
-    async def test_protected_resource_contains_mcp_path(self, app):
-        """resource field must end with /mcp."""
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get("/.well-known/oauth-protected-resource")
-
-        assert response.json()["resource"].endswith("/mcp")
-
-    @pytest.mark.asyncio
-    async def test_authorization_server_metadata_shape(self, app):
-        """/.well-known/oauth-authorization-server returns required RFC 8414 fields."""
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get("/.well-known/oauth-authorization-server")
-
-        assert response.status_code == 200
-        data = response.json()
-        for field in (
-            "issuer",
-            "authorization_endpoint",
-            "token_endpoint",
-            "response_types_supported",
-            "grant_types_supported",
+        with patch.object(
+            oauth_middleware, "get_access_token", return_value=fake
         ):
-            assert field in data, f"Missing field: {field}"
-
-    @pytest.mark.asyncio
-    async def test_authorization_server_endpoints_point_to_redmine(self, app):
-        """authorization_endpoint and token_endpoint must use REDMINE_URL."""
-        from redmine_mcp_server.main import REDMINE_URL
-
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get("/.well-known/oauth-authorization-server")
-
-        data = response.json()
-        assert data["authorization_endpoint"].startswith(REDMINE_URL)
-        assert data["token_endpoint"].startswith(REDMINE_URL)
-
-    @pytest.mark.asyncio
-    async def test_authorization_server_supports_pkce(self, app):
-        """Must advertise S256 PKCE support."""
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            response = await client.get("/.well-known/oauth-authorization-server")
-
-        assert "S256" in response.json()["code_challenge_methods_supported"]
-
-    @pytest.mark.asyncio
-    async def test_well_known_accessible_without_auth_in_oauth_mode(self):
-        """Discovery endpoints must be reachable without a Bearer token even in oauth mode."""  # noqa: E501
-        import os
-
-        with patch.dict(os.environ, {"REDMINE_AUTH_MODE": "oauth"}):
-            # Import fresh app state isn't possible after module load, so test
-            # the middleware skip-path logic directly via _make_app equivalent.
-            from starlette.applications import Starlette
-            from starlette.requests import Request
-            from starlette.responses import JSONResponse
-            from starlette.routing import Route
-            from redmine_mcp_server.oauth_middleware import RedmineOAuthMiddleware
-
-            async def discovery(request: Request):
-                return JSONResponse({"issuer": "http://test"})
-
-            app = Starlette(
-                routes=[
-                    Route("/.well-known/oauth-authorization-server", discovery),
-                    Route("/.well-known/oauth-protected-resource", discovery),
-                ]
-            )
-            app.add_middleware(RedmineOAuthMiddleware)
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                r1 = await client.get("/.well-known/oauth-authorization-server")
-                r2 = await client.get("/.well-known/oauth-protected-resource")
-
-        assert r1.status_code == 200
-        assert r2.status_code == 200
+            assert oauth_middleware.get_current_token() == "ctx-token-xyz"
 
 
 # ---------------------------------------------------------------------------
@@ -460,306 +184,126 @@ class TestWellKnownEndpoints:
 
 @pytest.mark.unit
 class TestGetRedmineClient:
-    """Tests for _get_redmine_client() auth mode selection."""
-
     @pytest.fixture(autouse=True)
     def _reset_legacy_cache(self):
-        """Clear cached legacy client between tests."""
         import redmine_mcp_server.redmine_handler as rh
 
         rh._legacy_client = None
         yield
         rh._legacy_client = None
 
-    def test_uses_oauth_token_when_context_var_is_set(self):
-        """When a token is in the ContextVar, a Bearer-auth client is returned."""
-        from redmine_mcp_server.oauth_middleware import current_redmine_token
+    def test_uses_oauth_token_when_present(self):
+        from redmine_mcp_server import oauth_middleware
         from redmine_mcp_server.redmine_handler import _get_redmine_client
 
-        token_var = current_redmine_token.set("oauth-token-abc")
-        try:
-            with patch("redmine_mcp_server.redmine_handler.Redmine") as mock_redmine:
-                _get_redmine_client()
-                call_kwargs = mock_redmine.call_args.kwargs
-                headers = call_kwargs["requests"]["headers"]
-                assert headers["Authorization"] == "Bearer oauth-token-abc"
-        finally:
-            current_redmine_token.reset(token_var)
+        with (
+            patch.object(
+                oauth_middleware, "get_current_token", return_value="oauth-token-abc"
+            ),
+            patch("redmine_mcp_server.redmine_handler.Redmine") as mock_redmine,
+        ):
+            _get_redmine_client()
+            headers = mock_redmine.call_args.kwargs["requests"]["headers"]
+            assert headers["Authorization"] == "Bearer oauth-token-abc"
 
-    def test_falls_back_to_api_key_when_no_context_token(self):
-        """Without a ContextVar token, API key is used."""
-        from redmine_mcp_server.oauth_middleware import current_redmine_token
+    def test_falls_back_to_api_key_without_oauth_token(self):
+        from redmine_mcp_server import oauth_middleware
         from redmine_mcp_server.redmine_handler import _get_redmine_client
         import redmine_mcp_server.redmine_handler as rh
 
-        token_var = current_redmine_token.set(None)
-        try:
-            with (
-                patch.object(rh, "REDMINE_API_KEY", "test-api-key"),
-                patch("redmine_mcp_server.redmine_handler.Redmine") as mock_redmine,
-            ):
-                _get_redmine_client()
-                call_kwargs = mock_redmine.call_args
-                assert call_kwargs.kwargs.get("key") == "test-api-key"
-        finally:
-            current_redmine_token.reset(token_var)
+        with (
+            patch.object(oauth_middleware, "get_current_token", return_value=None),
+            patch.object(rh, "REDMINE_API_KEY", "test-api-key"),
+            patch("redmine_mcp_server.redmine_handler.Redmine") as mock_redmine,
+        ):
+            _get_redmine_client()
+            assert mock_redmine.call_args.kwargs.get("key") == "test-api-key"
 
-    def test_falls_back_to_username_password_when_no_api_key(self):
-        """Without a ContextVar token or API key, username/password is used."""
-        from redmine_mcp_server.oauth_middleware import current_redmine_token
+    def test_oauth_token_priority_over_api_key(self):
+        from redmine_mcp_server import oauth_middleware
         from redmine_mcp_server.redmine_handler import _get_redmine_client
         import redmine_mcp_server.redmine_handler as rh
 
-        token_var = current_redmine_token.set(None)
-        try:
-            with (
-                patch.object(rh, "REDMINE_API_KEY", None),
-                patch.object(rh, "REDMINE_USERNAME", "user"),
-                patch.object(rh, "REDMINE_PASSWORD", "pass"),
-                patch("redmine_mcp_server.redmine_handler.Redmine") as mock_redmine,
-            ):
-                _get_redmine_client()
-                call_kwargs = mock_redmine.call_args
-                assert call_kwargs.kwargs.get("username") == "user"
-                assert call_kwargs.kwargs.get("password") == "pass"
-        finally:
-            current_redmine_token.reset(token_var)
-
-    def test_raises_when_no_auth_configured(self):
-        """Raises RuntimeError when no auth is available at all."""
-        from redmine_mcp_server.oauth_middleware import current_redmine_token
-        from redmine_mcp_server.redmine_handler import _get_redmine_client
-        import redmine_mcp_server.redmine_handler as rh
-
-        token_var = current_redmine_token.set(None)
-        try:
-            with (
-                patch.object(rh, "REDMINE_API_KEY", None),
-                patch.object(rh, "REDMINE_USERNAME", None),
-                patch.object(rh, "REDMINE_PASSWORD", None),
-            ):
-                with pytest.raises(
-                    RuntimeError, match="No Redmine authentication available"
-                ):
-                    _get_redmine_client()
-        finally:
-            current_redmine_token.reset(token_var)
-
-    def test_oauth_token_takes_priority_over_api_key(self):
-        """OAuth ContextVar token wins even if REDMINE_API_KEY is also set."""
-        from redmine_mcp_server.oauth_middleware import current_redmine_token
-        from redmine_mcp_server.redmine_handler import _get_redmine_client
-        import redmine_mcp_server.redmine_handler as rh
-
-        token_var = current_redmine_token.set("oauth-wins")
-        try:
-            with (
-                patch.object(rh, "REDMINE_API_KEY", "should-not-be-used"),
-                patch("redmine_mcp_server.redmine_handler.Redmine") as mock_redmine,
-            ):
-                _get_redmine_client()
-                call_kwargs = mock_redmine.call_args.kwargs
-                # Should use requests/headers, not key=
-                assert "key" not in call_kwargs
-                assert (
-                    call_kwargs["requests"]["headers"]["Authorization"]
-                    == "Bearer oauth-wins"
-                )
-        finally:
-            current_redmine_token.reset(token_var)
+        with (
+            patch.object(
+                oauth_middleware, "get_current_token", return_value="oauth-wins"
+            ),
+            patch.object(rh, "REDMINE_API_KEY", "should-not-be-used"),
+            patch("redmine_mcp_server.redmine_handler.Redmine") as mock_redmine,
+        ):
+            _get_redmine_client()
+            kw = mock_redmine.call_args.kwargs
+            assert "key" not in kw
+            assert kw["requests"]["headers"]["Authorization"] == "Bearer oauth-wins"
 
 
 # ---------------------------------------------------------------------------
-# /revoke endpoint (RFC 7009 — OAuth 2.0 Token Revocation)
+# Mounted app: discovery + DCR
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-class TestRevokeEndpoint:
-    """Tests for the /revoke token revocation endpoint."""
+class TestMountedOAuthApp:
+    """End-to-end: when the server is built in oauth mode, the mounted app
+    exposes the discovery and registration endpoints DCR clients require."""
 
     @pytest.fixture
     def app(self):
-        from redmine_mcp_server.main import app, register_oauth_routes
+        # Import requires env vars to be set (already done at module top).
+        with patch.dict(os.environ, {"REDMINE_AUTH_MODE": "oauth"}, clear=False):
+            # Force fresh module import so FastMCP is built with auth=
+            import importlib
+            import redmine_mcp_server.redmine_handler as rh
+            import redmine_mcp_server.main as main
 
-        register_oauth_routes(app)
-        return app
-
-    @pytest.mark.asyncio
-    async def test_revoke_with_bearer_header_success(self, app):
-        """Token in Authorization header is forwarded to Redmine and returns success."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        with patch("redmine_mcp_server.main.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.post(
-                    "/revoke", headers={"Authorization": "Bearer test-token-123"}
-                )
-
-        assert response.status_code == 200
-        assert response.json()["success"] is True
-        # Verify token was forwarded to Redmine
-        call_kwargs = mock_client.post.call_args
-        assert call_kwargs.kwargs["data"]["token"] == "test-token-123"
+            importlib.reload(rh)
+            importlib.reload(main)
+            yield main.app
 
     @pytest.mark.asyncio
-    async def test_revoke_with_json_body_success(self, app):
-        """Token in JSON body is forwarded to Redmine and returns success."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        with patch("redmine_mcp_server.main.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.post(
-                    "/revoke",
-                    json={"token": "json-body-token"},
-                    headers={"Content-Type": "application/json"},
-                )
-
-        assert response.status_code == 200
-        assert response.json()["success"] is True
-        call_kwargs = mock_client.post.call_args
-        assert call_kwargs.kwargs["data"]["token"] == "json-body-token"
-
-    @pytest.mark.asyncio
-    async def test_revoke_with_form_body_success(self, app):
-        """Token in form-encoded body is forwarded to Redmine."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        with patch("redmine_mcp_server.main.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.post("/revoke", data={"token": "form-token"})
-
-        assert response.status_code == 200
-        assert response.json()["success"] is True
-
-    @pytest.mark.asyncio
-    async def test_revoke_no_token_returns_400(self, app):
-        """Returns 400 when no token is provided."""
+    async def test_authorization_server_advertises_registration_endpoint(self, app):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            response = await client.post("/revoke")
+            response = await client.get("/.well-known/oauth-authorization-server")
 
-        assert response.status_code == 400
-        assert response.json()["error"] == "invalid_request"
+        assert response.status_code == 200
+        data = response.json()
+        # The fix: registration_endpoint must be advertised so DCR-only clients
+        # (Codex CLI, Claude Desktop) don't bail with "DCR not supported".
+        assert "registration_endpoint" in data
+        assert data["registration_endpoint"].endswith("/register")
+        assert "S256" in data["code_challenge_methods_supported"]
 
     @pytest.mark.asyncio
-    async def test_revoke_redmine_unreachable_returns_502(self, app):
-        """Returns 502 when Redmine cannot be reached."""
-        import httpx
-
-        with patch("redmine_mcp_server.main.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(
-                side_effect=httpx.RequestError("connection refused")
+    async def test_register_endpoint_accepts_dynamic_client(self, app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/register",
+                json={
+                    "redirect_uris": ["http://127.0.0.1:1455/callback"],
+                    "client_name": "codex-cli",
+                },
             )
-            mock_cls.return_value = mock_client
 
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.post(
-                    "/revoke", headers={"Authorization": "Bearer any-token"}
-                )
-
-        assert response.status_code == 502
-        assert response.json()["error"] == "upstream_unavailable"
+        assert response.status_code == 201
+        body = response.json()
+        assert body["client_id"]
+        assert body["client_secret"]
+        assert body["redirect_uris"] == ["http://127.0.0.1:1455/callback"]
 
     @pytest.mark.asyncio
-    async def test_revoke_returns_success_even_for_invalid_token(self, app):
-        """Per RFC 7009, returns 200 even if Redmine says token is invalid."""
-        mock_response = MagicMock()
-        mock_response.status_code = 400
-        mock_response.text = "invalid token"
+    async def test_protected_resource_metadata_present(self, app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # FastMCP scopes the protected-resource document to the MCP path.
+            response = await client.get(
+                "/.well-known/oauth-protected-resource/mcp"
+            )
 
-        with patch("redmine_mcp_server.main.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.post(
-                    "/revoke", headers={"Authorization": "Bearer invalid-token"}
-                )
-
-        # RFC 7009: always return success to prevent token scanning
         assert response.status_code == 200
-        assert response.json()["success"] is True
-
-    @pytest.mark.asyncio
-    async def test_revoke_calls_correct_redmine_endpoint(self, app):
-        """Verifies the call goes to /oauth/revoke on Redmine."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        with patch("redmine_mcp_server.main.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                await client.post("/revoke", headers={"Authorization": "Bearer token"})
-
-            call_args = mock_client.post.call_args
-            assert "/oauth/revoke" in call_args.args[0]
-
-    @pytest.mark.asyncio
-    async def test_revoke_bypasses_oauth_middleware(self, app):
-        """/revoke is accessible without OAuth middleware blocking it."""
-        # This test verifies the endpoint is in SKIP_AUTH_PATHS
-        # We don't mock httpx here - just verify no 401 from middleware
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        with patch("redmine_mcp_server.main.httpx.AsyncClient") as mock_cls:
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_cls.return_value = mock_client
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                # Send token in body (not header) - if middleware ran, it would reject
-                response = await client.post("/revoke", json={"token": "test"})
-
-        # If we get here without 401, the middleware was bypassed
-        assert response.status_code == 200
+        data = response.json()
+        assert "authorization_servers" in data
