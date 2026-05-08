@@ -26,7 +26,7 @@ def _redmine_url() -> str:
 
 def _redmine_internal_url() -> str:
     # Server-to-server URL for /token, /revoke, /oauth/token/info. Falls back
-    # to REDMINE_URL; override when the container reaches Redmine on a
+    # to REDMINE_URL; override when the MCP container reaches Redmine on a
     # different hostname than the browser does.
     return os.environ.get("REDMINE_INTERNAL_URL", "").rstrip("/") or _redmine_url()
 

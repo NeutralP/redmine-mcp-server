@@ -93,7 +93,7 @@ No client needs manual `client_id`/`client_secret`. The redirect URI in Redmine 
 | `Dynamic client registration not supported` | Server isn't in OAuth mode, or running an old build | Check `REDMINE_AUTH_MODE=oauth`; `curl /.well-known/oauth-authorization-server` should show `registration_endpoint` |
 | `OAuth mode requires the following env vars` at startup | `REDMINE_OAUTH_CLIENT_ID/SECRET` missing | Set both env vars |
 | Browser opens, Redmine login OK, callback errors | Redirect URI in Redmine doesn't match `<REDMINE_MCP_BASE_URL>/auth/callback` | Update Redmine app's Redirect URI |
-| Token works in Redmine but MCP returns 401 | `REDMINE_URL` is wrong from inside the container | In Docker, use the internal hostname (e.g. `http://redmine:3000`) |
+| Token works in Redmine but MCP returns 401 | `REDMINE_URL` is wrong from inside the container | Set `REDMINE_INTERNAL_URL=http://host.docker.internal:8080` (server-to-server URL) while keeping `REDMINE_URL` browser-reachable |
 | "Applications" menu missing in Redmine | Redmine too old | Requires Redmine 6.1+ |
 
 ## Security notes
