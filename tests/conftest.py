@@ -31,23 +31,15 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_test_environment():
-    """Set up test environment before running tests."""
-    import os
     import sys
 
-    # Add src to Python path if not already there
     src_path = os.path.join(os.path.dirname(__file__), "..", "src")
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
 
-    # Set test environment variable
     os.environ["TESTING"] = "true"
-
     yield
-
-    # Cleanup after tests
-    if "TESTING" in os.environ:
-        del os.environ["TESTING"]
+    os.environ.pop("TESTING", None)
 
 
 @pytest.fixture

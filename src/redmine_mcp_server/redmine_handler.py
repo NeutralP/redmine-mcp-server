@@ -83,11 +83,8 @@ if not _env_loaded:
     # Try default load_dotenv() behavior as final fallback
     load_dotenv()
 
-# Load Redmine configuration.
-# REDMINE_INTERNAL_URL takes precedence so that server-to-server calls work
-# even when the MCP server reaches Redmine via a different hostname than the
-# browser does (e.g. in Docker: REDMINE_URL=http://localhost:8080 but the
-# container reaches the host via http://host.docker.internal:8080).
+# REDMINE_INTERNAL_URL wins so server-to-server calls work when the container
+# reaches Redmine on a different hostname than the browser does.
 REDMINE_URL = os.getenv("REDMINE_INTERNAL_URL") or os.getenv("REDMINE_URL")
 REDMINE_USERNAME = os.getenv("REDMINE_USERNAME")
 REDMINE_PASSWORD = os.getenv("REDMINE_PASSWORD")
@@ -209,11 +206,9 @@ def _get_redmine_client() -> Redmine:
     return _legacy_client
 
 
-# Initialize FastMCP server. In OAuth mode we attach FastMCP's OAuthProxy as
-# the auth provider — it serves /.well-known discovery, /register (DCR shim),
-# /authorize, /token, and /auth/callback, and bridges DCR-only MCP clients
-# (Claude Desktop, Codex CLI, VS Code) to Redmine's static Doorkeeper app.
 def _build_mcp() -> FastMCP:
+    # In OAuth mode the proxy registers /.well-known, /register, /authorize,
+    # /token, /revoke, and /auth/callback on the mounted Starlette app.
     if REDMINE_AUTH_MODE == "oauth":
         from .oauth_middleware import build_oauth_proxy
 

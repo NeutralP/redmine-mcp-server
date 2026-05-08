@@ -44,10 +44,6 @@ def get_version() -> str:
         return "dev"
 
 
-# Export the Starlette app for testing and external use.
-# When OAuth mode is active, the ``mcp`` instance was built with
-# ``auth=OAuthProxy(...)`` (see redmine_handler._build_mcp), which transparently
-# registers the discovery, registration, and OAuth flow routes on this app.
 app = mcp.http_app(stateless_http=True)
 
 logger.info("Redmine MCP Server v%s", get_version())
