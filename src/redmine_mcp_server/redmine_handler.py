@@ -83,8 +83,12 @@ if not _env_loaded:
     # Try default load_dotenv() behavior as final fallback
     load_dotenv()
 
-# Load Redmine configuration
-REDMINE_URL = os.getenv("REDMINE_URL")
+# Load Redmine configuration.
+# REDMINE_INTERNAL_URL takes precedence so that server-to-server calls work
+# even when the MCP server reaches Redmine via a different hostname than the
+# browser does (e.g. in Docker: REDMINE_URL=http://localhost:8080 but the
+# container reaches the host via http://host.docker.internal:8080).
+REDMINE_URL = os.getenv("REDMINE_INTERNAL_URL") or os.getenv("REDMINE_URL")
 REDMINE_USERNAME = os.getenv("REDMINE_USERNAME")
 REDMINE_PASSWORD = os.getenv("REDMINE_PASSWORD")
 REDMINE_API_KEY = os.getenv("REDMINE_API_KEY")
